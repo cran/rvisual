@@ -1,0 +1,250 @@
+#' Capa de Integracion con IA
+#'
+#' Usa curl directamente para mayor compatibilidad con proxies corporativos.
+
+# -- Interfaz com\u00fan --------------------------------------------------------
+
+#' Enviar prompt al proveedor de IA configurado
+#'
+#' @param cfg Lista de configuracion (provider, api_key, model, etc.).
+#' @param system_prompt Prompt de sistema (contexto/instrucciones).
+#' @param user_prompt Prompt del usuario.
+#' @return Lista con \code{text} (respuesta completa) y \code{code}
+#'   (bloque de codigo R extraido de la respuesta, si existe).
+#' @export
+ai_send <- function(cfg, system_prompt, user_prompt) {
+  stopifnot(!is.null(cfg$provider), !is.null(cfg$api_key))
+
+  response_text <- switch(cfg$provider,
+    "openai"    = provider_openai(cfg, system_prompt, user_prompt),
+    "anthropic" = provider_anthropic(cfg, system_prompt, user_prompt),
+    "gemini"    = provider_gemini(cfg, system_prompt, user_prompt),
+    stop(glue::glue("Proveedor no soportado: {cfg$provider}"))
+  )
+
+  code_block <- extract_r_code_block(response_text)
+  list(text = response_text, code = code_block)
+}
+
+#' Probar la conexion con el proveedor de IA configurado
+#'
+#' @param cfg Lista de configuracion (provider, api_key, model, etc.).
+#' @return Lista con \code{success} (logical) y \code{message} (detalle).
+#' @export
+ai_test_connection <- function(cfg) {
+  # Primero verificar conectividad b\u00e1sica a internet
+  internet_ok <- tryCatch({
+    con <- url("https://www.google.com", open = "r")
+    close(con)
+    TRUE
+  }, error = function(e) FALSE, warning = function(w) FALSE)
+
+  if (!internet_ok) {
+    return(list(success = FALSE,
+                message = "Sin acceso a internet desde R. Verific\u00e1 proxy o firewall."))
+  }
+
+  tryCatch({
+    res <- ai_send(cfg,
+                   system_prompt = "Eres un asistente de prueba.",
+                   user_prompt   = "Respond\u00e9 solo: OK")
+    list(success = TRUE, message = res$text)
+  }, error = function(e) {
+    list(success = FALSE, message = e$message)
+  })
+}
+
+# -- Helper HTTP unificado -------------------------------------------------
+
+http_post_json <- function(url, headers, body_list) {
+  body_json <- jsonlite::toJSON(body_list, auto_unbox = TRUE)
+
+  # Leer proxy del entorno (soporta http_proxy, HTTP_PROXY, https_proxy)
+  proxy <- Sys.getenv("https_proxy",
+           Sys.getenv("HTTPS_PROXY",
+           Sys.getenv("http_proxy",
+           Sys.getenv("HTTP_PROXY", ""))))
+
+  # Intentar con httr2
+  result <- tryCatch({
+    req <- httr2::request(url)
+    for (nm in names(headers)) {
+      req <- httr2::req_headers(req, !!nm := headers[[nm]])
+    }
+    req <- req |>
+      httr2::req_body_raw(body_json, type = "application/json") |>
+      httr2::req_timeout(45) |>
+      httr2::req_error(is_error = function(r) FALSE)
+
+    # Aplicar proxy si est\u00e1 configurado
+    if (nzchar(proxy)) {
+      req <- httr2::req_options(req, proxy = proxy)
+    }
+
+    resp <- httr2::req_perform(req)
+    httr2::resp_body_json(resp)
+  }, error = function(e1) {
+    # Fallback: curl del sistema (respeta proxy del SO autom\u00e1ticamente)
+    if (nzchar(Sys.which("curl"))) {
+      header_args <- paste(
+        sapply(names(headers), function(h)
+          paste0('-H "', h, ': ', headers[[h]], '"')),
+        collapse = " "
+      )
+      proxy_arg <- if (nzchar(proxy)) paste0('-x "', proxy, '" ') else ""
+      tmp_body <- tempfile(fileext = ".json")
+      tmp_out  <- tempfile(fileext = ".json")
+      writeLines(body_json, tmp_body)
+      cmd <- sprintf('curl -s -X POST %s%s -d @"%s" "%s" -o "%s"',
+                     proxy_arg, header_args, tmp_body, url, tmp_out)
+      system(cmd, wait = TRUE)
+      if (file.exists(tmp_out) && file.size(tmp_out) > 0) {
+        jsonlite::fromJSON(tmp_out, simplifyVector = FALSE)
+      } else {
+        stop(e1$message)
+      }
+    } else {
+      stop(e1$message)
+    }
+  })
+  result
+}
+
+# -- Proveedores -----------------------------------------------------------
+
+provider_anthropic <- function(cfg, system_prompt, user_prompt) {
+  parsed <- http_post_json(
+    url     = "https://api.anthropic.com/v1/messages",
+    headers = list(
+      "x-api-key"         = cfg$api_key,
+      "anthropic-version" = "2023-06-01",
+      "content-type"      = "application/json"
+    ),
+    body_list = list(
+      model      = cfg$model %||% "claude-haiku-4-5-20251001",
+      max_tokens = 2048,
+      system     = system_prompt,
+      messages   = list(list(role = "user", content = user_prompt))
+    )
+  )
+  if (!is.null(parsed$error)) stop(parsed$error$message)
+  parsed$content[[1]]$text
+}
+
+provider_openai <- function(cfg, system_prompt, user_prompt) {
+  parsed <- http_post_json(
+    url     = "https://api.openai.com/v1/chat/completions",
+    headers = list(
+      "Authorization" = paste("Bearer", cfg$api_key),
+      "Content-Type"  = "application/json"
+    ),
+    body_list = list(
+      model    = cfg$model %||% "gpt-4o-mini",
+      messages = list(
+        list(role = "system", content = system_prompt),
+        list(role = "user",   content = user_prompt)
+      )
+    )
+  )
+  if (!is.null(parsed$error)) stop(parsed$error$message)
+  parsed$choices[[1]]$message$content
+}
+
+provider_gemini <- function(cfg, system_prompt, user_prompt) {
+  model_id <- cfg$model %||% "gemini-1.5-flash"
+  url      <- paste0(
+    "https://generativelanguage.googleapis.com/v1beta/models/",
+    model_id, ":generateContent?key=", cfg$api_key
+  )
+  parsed <- http_post_json(
+    url     = url,
+    headers = list("Content-Type" = "application/json"),
+    body_list = list(
+      contents = list(list(
+        parts = list(list(text = paste0(system_prompt, "\n\n", user_prompt)))
+      ))
+    )
+  )
+  if (!is.null(parsed$error)) stop(parsed$error$message)
+  parsed$candidates[[1]]$content$parts[[1]]$text
+}
+
+# -- Contexto y prompts ----------------------------------------------------
+
+#' Construir el prompt de sistema para el asistente IA
+#'
+#' @param ctx Lista de contexto construida por \code{build_ai_context()}.
+#' @return String con el prompt de sistema completo.
+#' @export
+build_system_prompt <- function(ctx) {
+  ops_section <- if (length(ctx$ops) > 0)
+    paste0("OPERACIONES YA APLICADAS:\n", ctx$ops_text, "\n\n") else ""
+  sample_section <- if (!is.null(ctx$sample_text))
+    paste0("MUESTRA DE DATOS (5 filas):\n", ctx$sample_text, "\n\n") else ""
+
+  paste0(
+    "Sos un asistente de an\u00e1lisis de datos especializado en R y tidyverse.\n",
+    "Tu rol es ayudar a usuarios que vienen de SPSS a trabajar en R.\n\n",
+    "DATASET ACTIVO: ", ctx$df_name, "\n",
+    "Filas: ", ctx$nrow, " | Columnas: ", ctx$ncol, "\n\n",
+    "VARIABLES DISPONIBLES:\n", ctx$schema_text, "\n\n",
+    sample_section,
+    ops_section,
+    "REGLAS:\n",
+    "1. Gener\u00e1 SOLO c\u00f3digo R usando dplyr/tidyr/pipe nativo (|>).\n",
+    "2. No inventes columnas que no est\u00e9n en la lista de variables.\n",
+    "3. SIEMPRE us\u00e1 exactamente '", ctx$df_name, "' como nombre del dataset en el c\u00f3digo. NUNCA uses otro nombre.\n",
+    "4. Si el pedido es ambiguo, pregunt\u00e1 antes de asumir.\n",
+    "5. Explic\u00e1 brevemente qu\u00e9 hace el c\u00f3digo.\n",
+    "6. Encerr\u00e1 el c\u00f3digo R en bloque ```r ... ```.\n",
+    "7. Si el usuario menciona sintaxis SPSS, traducila al equivalente en R."
+  )
+}
+
+#' Construir el contexto para el asistente IA a partir del dataset activo
+#'
+#' @param df Data.frame activo.
+#' @param df_name Nombre del dataset activo.
+#' @param ops Lista de operaciones ya aplicadas (stack del builder).
+#' @param include_rows Logical; si es TRUE incluye una muestra de filas
+#'   en el contexto enviado a la IA.
+#' @return Lista de contexto usada por \code{build_system_prompt()}.
+#' @export
+build_ai_context <- function(df, df_name, ops, include_rows = FALSE) {
+  meta <- get_metadata(df, df_name)
+  schema_lines <- apply(meta$columns, 1, function(row) {
+    paste0("  - ", row["name"], " (", row["visual"], ")")
+  })
+  sample_text <- if (include_rows && nrow(df) > 0) {
+    paste(utils::capture.output(print(head(df, 5))), collapse = "\n")
+  } else NULL
+
+  ops_text <- if (length(ops) > 0) {
+    paste(vapply(ops, function(o) paste0("  - ", o$label), character(1)),
+          collapse = "\n")
+  } else NULL
+
+  list(
+    df_name     = df_name,
+    nrow        = meta$nrow,
+    ncol        = meta$ncol,
+    schema_text = paste(schema_lines, collapse = "\n"),
+    sample_text = sample_text,
+    ops         = ops,
+    ops_text    = ops_text
+  )
+}
+
+# -- Extracci\u00f3n de c\u00f3digo --------------------------------------------------
+
+extract_r_code_block <- function(text) {
+  # (?s) = DOTALL: el punto captura tambi\u00e9n saltos de l\u00ednea
+  pattern <- "(?s)```(?:r|R)?[ \t]*\n?(.*?)```"
+  matches <- regmatches(text, regexpr(pattern, text, perl = TRUE))
+  if (length(matches) == 0 || nchar(matches) == 0) return(NULL)
+  code <- gsub("```(?:r|R)?[ \t]*\n?|```", "", matches, perl = TRUE)
+  trimws(code)
+}
+
+# -- null-coalesce ---------------------------------------------------------
+`%||%` <- function(a, b) if (!is.null(a) && nchar(as.character(a)) > 0) a else b

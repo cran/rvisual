@@ -1,0 +1,468 @@
+#' Modulo: Conexion a Base de Datos
+#'
+#' Permite conectarse a PostgreSQL, MySQL, SQL Server, Oracle, SQLite y DB2
+#' y cargar tablas como datasets activos en RVisual.
+
+# ── Helpers de persistencia de config de BD ───────────────────────────────
+
+#' Guardar ultima configuracion de BD para un motor
+#' @keywords internal
+db_config_save <- function(tipo, host, port, dbname, user,
+                           oracle_service = NULL, oracle_conn_type = NULL,
+                           driver_name = NULL) {
+  cfg <- config_load()
+  if (is.null(cfg$db_last)) cfg$db_last <- list()
+  cfg$db_last[[tipo]] <- list(
+    host             = host,
+    port             = port,
+    dbname           = dbname,
+    user             = user,
+    oracle_service   = oracle_service,
+    oracle_conn_type = oracle_conn_type,
+    driver_name      = driver_name
+  )
+  config_save(cfg)
+}
+
+#' Cargar ultima configuracion de BD para un motor
+#' @keywords internal
+db_config_load <- function(tipo) {
+  cfg <- config_load()
+  if (is.null(cfg$db_last)) return(NULL)
+  cfg$db_last[[tipo]]
+}
+
+#' @keywords internal
+db_drivers <- function() {
+  list(
+    postgresql = list(label = "PostgreSQL",  pkg = "RPostgres",  drv = "RPostgres::Postgres()",
+                      port = 5432,  needs_db = TRUE,  needs_host = TRUE),
+    mysql      = list(label = "MySQL/MariaDB", pkg = "RMySQL",   drv = "RMySQL::MySQL()",
+                      port = 3306,  needs_db = TRUE,  needs_host = TRUE),
+    sqlserver  = list(label = "SQL Server",  pkg = "odbc",       drv = "odbc::odbc()",
+                      port = 1433,  needs_db = TRUE,  needs_host = TRUE),
+    oracle     = list(label = "Oracle",      pkg = "ROracle",    drv = "ROracle::Oracle()",
+                      port = 1521,  needs_db = FALSE, needs_host = TRUE),
+    sqlite     = list(label = "SQLite",      pkg = "RSQLite",    drv = "RSQLite::SQLite()",
+                      port = NA,    needs_db = FALSE, needs_host = FALSE),
+    db2        = list(label = "IBM DB2",     pkg = "odbc",       drv = "odbc::odbc()",
+                      port = 50000, needs_db = TRUE,  needs_host = TRUE)
+  )
+}
+
+#' @keywords internal
+db_connect <- function(tipo, host, port, dbname, user, password, filepath = NULL,
+                       driver_name = NULL, oracle_service = NULL,
+                       oracle_conn_type = "service") {
+  drivers <- db_drivers()
+  cfg     <- drivers[[tipo]]
+
+  # Verificar que el paquete necesario est\u00e1 disponible
+  pkg <- cfg$pkg
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(paste0("Paquete '", pkg, "' no instalado. Ejecut\u00e1: install.packages('", pkg, "')"))
+  }
+
+  con <- switch(tipo,
+    postgresql = DBI::dbConnect(
+      RPostgres::Postgres(),
+      host     = host,
+      port     = as.integer(port),
+      dbname   = dbname,
+      user     = user,
+      password = password
+    ),
+    mysql = DBI::dbConnect(
+      RMySQL::MySQL(),
+      host     = host,
+      port     = as.integer(port),
+      dbname   = dbname,
+      user     = user,
+      password = password
+    ),
+    sqlserver = DBI::dbConnect(
+      odbc::odbc(),
+      Driver   = if (!is.null(driver_name) && nchar(driver_name) > 0)
+                   driver_name else "ODBC Driver 17 for SQL Server",
+      Server   = paste0(host, ",", port),
+      Database = dbname,
+      UID      = user,
+      PWD      = password
+    ),
+    oracle = DBI::dbConnect(
+      ROracle::Oracle(),
+      username = user,
+      password = password,
+      dbname   = if (!is.null(oracle_service) && nchar(trimws(oracle_service)) > 0) {
+        svc <- trimws(oracle_service)
+        # Si ya es un TNS completo (empieza con paréntesis), usarlo directo
+        if (startsWith(svc, "(")) svc
+        # Si es SID
+        else if (!is.null(oracle_conn_type) && oracle_conn_type == "sid")
+          paste0(host, ":", port, ":", svc)
+        # Si es Service Name (default)
+        else paste0(host, ":", port, "/", svc)
+      } else {
+        paste0(host, ":", port)
+      }
+    ),
+    sqlite = DBI::dbConnect(
+      RSQLite::SQLite(),
+      dbname = filepath
+    ),
+    db2 = DBI::dbConnect(
+      odbc::odbc(),
+      Driver   = if (!is.null(driver_name) && nchar(driver_name) > 0)
+                   driver_name else "IBM DB2 ODBC DRIVER",
+      Database = dbname,
+      Hostname = host,
+      Port     = as.integer(port),
+      UID      = user,
+      PWD      = password
+    ),
+    stop(paste0("Tipo de BD no soportado: ", tipo))
+  )
+  con
+}
+
+# ── UI ────────────────────────────────────────────────────────────────────
+
+#' UI del modulo de conexion a base de datos
+#'
+#' @param id ID del modulo Shiny.
+#' @return Un objeto shiny.tag con el formulario de conexion.
+#' @keywords internal
+mod_db_ui <- function(id) {
+  ns <- shiny::NS(id)
+
+  shiny::tagList(
+    shiny::h5(shiny::icon("database"), " Conectar a base de datos",
+              style = "margin-top:0"),
+
+    # Selector de tipo de BD
+    shiny::selectInput(ns("tipo"), "Motor",
+      choices = c(
+        "PostgreSQL"    = "postgresql",
+        "MySQL/MariaDB" = "mysql",
+        "SQL Server"    = "sqlserver",
+        "Oracle"        = "oracle",
+        "SQLite"        = "sqlite",
+        "IBM DB2"       = "db2"
+      ),
+      selected = "postgresql"
+    ),
+
+    # SQLite: solo selector de archivo
+    shiny::conditionalPanel(
+      condition = paste0("input['", ns("tipo"), "'] == 'sqlite'"),
+      shiny::fileInput(ns("sqlite_file"), "Archivo .db / .sqlite",
+        accept = c(".db", ".sqlite", ".sqlite3"),
+        buttonLabel = "Seleccionar\u2026"
+      )
+    ),
+
+    # Otros: formulario de conexi\u00f3n
+    shiny::conditionalPanel(
+      condition = paste0("input['", ns("tipo"), "'] != 'sqlite'"),
+      shiny::fluidRow(
+        shiny::column(8,
+          shiny::textInput(ns("host"), "Host / Servidor", value = "localhost")),
+        shiny::column(4,
+          shiny::numericInput(ns("port"), "Puerto", value = 5432, min = 1, max = 65535))
+      ),
+      shiny::conditionalPanel(
+        condition = paste0("input['", ns("tipo"), "'] != 'oracle'"),
+        shiny::textInput(ns("dbname"), "Base de datos / Schema", placeholder = "mi_base")
+      ),
+      shiny::fluidRow(
+        shiny::column(6,
+          shiny::textInput(ns("user"), "Usuario")),
+        shiny::column(6,
+          shiny::passwordInput(ns("password"), "Contrase\u00f1a"))
+      ),
+    # Driver ODBC (solo SQL Server y DB2)
+      shiny::conditionalPanel(
+        condition = paste0(
+          "input['", ns("tipo"), "'] == 'sqlserver' || ",
+          "input['", ns("tipo"), "'] == 'db2'"
+        ),
+        shiny::textInput(ns("driver_name"), "Driver ODBC (opcional)",
+          placeholder = "dejar vac\u00edo para usar el predeterminado")
+      ),
+      # Service Name / SID (solo Oracle)
+      shiny::conditionalPanel(
+        condition = paste0("input['", ns("tipo"), "'] == 'oracle'"),
+        shiny::fluidRow(
+          shiny::column(8,
+            shiny::textInput(ns("oracle_service"), "Service Name / SID",
+              placeholder = "ej: ORCL, XE, inedb")),
+          shiny::column(4,
+            shiny::selectInput(ns("oracle_conn_type"), "Tipo",
+              choices = c("Service Name" = "service", "SID" = "sid"),
+              selected = "service"))
+        ),
+        shiny::div(class = "ds-hint",
+          "Si us\u00e1s TNS, pod\u00e9s pegar el string completo en Service Name:
+          ej: (DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=...))...)")
+      )
+    ),
+
+    shiny::actionButton(ns("btn_conectar"), "Conectar",
+      icon = shiny::icon("plug"), class = "btn-primary btn-sm"),
+    shiny::div(class = "ds-hint mt-1",
+               shiny::textOutput(ns("msg_conexion"))),
+
+    shiny::hr(),
+
+    # Panel de exploraci\u00f3n (visible solo si hay conexi\u00f3n activa)
+    shiny::uiOutput(ns("panel_explorar"))
+  )
+}
+
+# ── Server ────────────────────────────────────────────────────────────────
+
+#' Server del modulo de conexion a base de datos
+#'
+#' @param id ID del modulo Shiny.
+#' @param active_dataset reactiveVal para el data.frame activo.
+#' @param active_name reactiveVal para el nombre del dataset activo.
+#' @param datasets_rv reactiveValues con la lista de datasets cargados.
+#' @param active_source reactiveVal opcional con metadata de origen del
+#'   dataset activo (ver code_generator.R).
+#' @return NULL (efectos secundarios sobre los reactiveVal recibidos).
+#' @keywords internal
+mod_db_server <- function(id, active_dataset, active_name, datasets_rv, active_source = NULL) {
+  shiny::moduleServer(id, function(input, output, session) {
+    ns <- session$ns
+
+    con_activa  <- shiny::reactiveVal(NULL)   # conexi\u00f3n DBI activa
+    tablas_list <- shiny::reactiveVal(NULL)   # vector de tablas disponibles
+    filepath_activa <- shiny::reactiveVal(NULL)  # ruta sqlite de la conexion activa (si aplica)
+
+    # ── Actualizar puerto al cambiar motor + cargar config guardada ───────
+    shiny::observeEvent(input$tipo, {
+      puertos <- c(postgresql = 5432, mysql = 3306, sqlserver = 1433,
+                   oracle = 1521, db2 = 50000)
+      p <- puertos[[input$tipo]]
+      if (!is.na(p)) shiny::updateNumericInput(session, "port", value = p)
+
+      # Cargar ultima config guardada para este motor
+      saved <- db_config_load(input$tipo)
+      if (!is.null(saved)) {
+        if (!is.null(saved$host))
+          shiny::updateTextInput(session, "host",   value = saved$host)
+        if (!is.null(saved$port))
+          shiny::updateNumericInput(session, "port", value = as.integer(saved$port))
+        if (!is.null(saved$dbname))
+          shiny::updateTextInput(session, "dbname", value = saved$dbname)
+        if (!is.null(saved$user))
+          shiny::updateTextInput(session, "user",   value = saved$user)
+        if (!is.null(saved$oracle_service))
+          shiny::updateTextInput(session, "oracle_service",
+                                 value = saved$oracle_service)
+        if (!is.null(saved$oracle_conn_type))
+          shiny::updateSelectInput(session, "oracle_conn_type",
+                                   selected = saved$oracle_conn_type)
+        if (!is.null(saved$driver_name))
+          shiny::updateTextInput(session, "driver_name",
+                                 value = saved$driver_name)
+        shiny::showNotification(
+          paste0("Configuraci\u00f3n anterior de ",
+                 db_drivers()[[input$tipo]]$label, " cargada."),
+          type = "message", duration = 2)
+      }
+    })
+
+    # ── Conectar ──────────────────────────────────────────────────────────
+    shiny::observeEvent(input$btn_conectar, {
+      # Cerrar conexi\u00f3n anterior si existe
+      if (!is.null(con_activa())) {
+        tryCatch(DBI::dbDisconnect(con_activa()), error = function(e) NULL)
+        con_activa(NULL)
+        tablas_list(NULL)
+      }
+
+      shiny::withProgress(message = "Conectando\u2026", value = 0.5, {
+        result <- tryCatch({
+          filepath <- if (input$tipo == "sqlite" && !is.null(input$sqlite_file))
+                        input$sqlite_file$datapath else NULL
+
+          con <- db_connect(
+            tipo             = input$tipo,
+            host             = input$host,
+            port             = input$port,
+            dbname           = input$dbname,
+            user             = input$user,
+            password         = input$password,
+            filepath         = filepath,
+            driver_name      = input$driver_name,
+            oracle_service   = input$oracle_service,
+            oracle_conn_type = input$oracle_conn_type
+          )
+          list(ok = TRUE, con = con)
+        }, error = function(e) {
+          list(ok = FALSE, msg = e$message)
+        })
+
+        if (result$ok) {
+          con_activa(result$con)
+          filepath_activa(filepath)
+          tablas <- tryCatch(DBI::dbListTables(result$con), error = function(e) character(0))
+          tablas_list(tablas)
+          # Guardar config para la proxima vez (sin contrasena)
+          db_config_save(
+            tipo             = input$tipo,
+            host             = input$host,
+            port             = input$port,
+            dbname           = input$dbname,
+            user             = input$user,
+            oracle_service   = input$oracle_service,
+            oracle_conn_type = input$oracle_conn_type,
+            driver_name      = input$driver_name
+          )
+          output$msg_conexion <- shiny::renderText(
+            paste0("\u2713 Conectado. ", length(tablas), " tabla(s) disponible(s).")
+          )
+          shiny::showNotification(
+            paste0("Conexi\u00f3n exitosa \u2014 ", length(tablas), " tablas"),
+            type = "message", duration = 3)
+        } else {
+          output$msg_conexion <- shiny::renderText(
+            paste0("\u2717 Error: ", result$msg)
+          )
+          shiny::showNotification(
+            paste0("Error de conexi\u00f3n: ", result$msg),
+            type = "error", duration = 8)
+        }
+      })
+    })
+
+    # ── Panel de exploraci\u00f3n ─────────────────────────────────────────────
+    output$panel_explorar <- shiny::renderUI({
+      shiny::req(con_activa(), tablas_list())
+      tablas <- tablas_list()
+      if (length(tablas) == 0) {
+        return(shiny::p(class = "ds-hint", "No se encontraron tablas."))
+      }
+
+      shiny::tagList(
+        shiny::h6(shiny::icon("table"), " Seleccionar tabla"),
+        shiny::selectInput(ns("tabla_sel"), NULL,
+          choices = c("-- elegir --" = "", tablas),
+          selected = ""
+        ),
+        shiny::fluidRow(
+          shiny::column(7,
+            shiny::textInput(ns("nombre_tabla_ds"),
+              "Nombre del dataset", placeholder = "ej: clientes")
+          ),
+          shiny::column(5,
+            shiny::numericInput(ns("limite_filas"),
+              "M\u00e1x. filas (0 = todas)", value = 10000, min = 0, step = 1000)
+          )
+        ),
+        shiny::actionButton(ns("btn_cargar_tabla"), "Cargar tabla",
+          icon = shiny::icon("download"), class = "btn-success btn-sm"),
+        shiny::div(class = "ds-hint mt-1",
+                   shiny::textOutput(ns("msg_carga_tabla"))),
+        shiny::hr(),
+        shiny::actionButton(ns("btn_desconectar"), "Desconectar",
+          icon = shiny::icon("plug-circle-xmark"),
+          class = "btn-sm btn-outline-danger")
+      )
+    })
+
+    # ── Cargar tabla ──────────────────────────────────────────────────────
+    shiny::observeEvent(input$btn_cargar_tabla, {
+      shiny::req(con_activa(), input$tabla_sel, nchar(input$tabla_sel) > 0)
+
+      nombre <- trimws(input$nombre_tabla_ds)
+      if (nchar(nombre) == 0) nombre <- input$tabla_sel
+
+      shiny::withProgress(message = paste0("Cargando '", input$tabla_sel, "'\u2026"), {
+        result <- tryCatch({
+          limite <- as.integer(input$limite_filas)
+          df <- if (limite > 0) {
+            # Sintaxis SQL segun motor
+            sql <- switch(input$tipo,
+              oracle     = paste0("SELECT * FROM ", input$tabla_sel,
+                                  " WHERE ROWNUM <= ", limite),
+              sqlserver  = paste0("SELECT TOP ", limite, " * FROM ",
+                                  input$tabla_sel),
+              db2        = paste0("SELECT * FROM ", input$tabla_sel,
+                                  " FETCH FIRST ", limite, " ROWS ONLY"),
+              # PostgreSQL, MySQL, SQLite
+              paste0("SELECT * FROM ", input$tabla_sel, " LIMIT ", limite)
+            )
+            DBI::dbGetQuery(con_activa(), sql)
+          } else {
+            DBI::dbReadTable(con_activa(), input$tabla_sel)
+          }
+          list(ok = TRUE, df = df)
+        }, error = function(e) {
+          list(ok = FALSE, msg = e$message)
+        })
+
+        if (result$ok) {
+          df <- result$df
+          datasets_rv$datasets[[nombre]] <- df
+          # Guardamos los metadatos de conexion (nunca la contrasena) para
+          # que el codigo generado pueda reconectarse de forma standalone
+          # (ver code_generator.R::generate_load_step).
+          datasets_rv$sources[[nombre]] <- list(
+            kind             = "db",
+            tipo             = input$tipo,
+            host             = input$host,
+            port             = input$port,
+            dbname           = input$dbname,
+            user             = input$user,
+            filepath         = filepath_activa(),
+            driver_name      = input$driver_name,
+            oracle_service   = input$oracle_service,
+            oracle_conn_type = input$oracle_conn_type,
+            tabla            = input$tabla_sel,
+            limite           = limite
+          )
+          # Dataset disponible en el entorno interno de RVisual, no en
+          # .GlobalEnv (evita el NOTE de R CMD check y no pisa objetos del
+          # usuario).
+          assign(nombre, df, envir = rvisual_env())
+          datasets_rv$seleccionado <- nombre
+          active_dataset(df)
+          active_name(nombre)
+          if (!is.null(active_source)) active_source(datasets_rv$sources[[nombre]])
+          output$msg_carga_tabla <- shiny::renderText(
+            paste0("\u2713 Cargado: ", nrow(df), " filas x ", ncol(df), " columnas")
+          )
+          shiny::showNotification(
+            paste0("'", nombre, "' cargado: ", nrow(df), " filas"),
+            type = "message", duration = 3)
+        } else {
+          output$msg_carga_tabla <- shiny::renderText(
+            paste0("\u2717 Error al cargar: ", result$msg)
+          )
+          shiny::showNotification(result$msg, type = "error", duration = 8)
+        }
+      })
+    })
+
+    # ── Desconectar ───────────────────────────────────────────────────────
+    shiny::observeEvent(input$btn_desconectar, {
+      if (!is.null(con_activa())) {
+        tryCatch(DBI::dbDisconnect(con_activa()), error = function(e) NULL)
+      }
+      con_activa(NULL)
+      tablas_list(NULL)
+      output$msg_conexion <- shiny::renderText("Desconectado.")
+      shiny::showNotification("Conexi\u00f3n cerrada.", type = "message", duration = 2)
+    })
+
+    # ── Cerrar conexi\u00f3n al destruir el m\u00f3dulo (limpieza) ─────────────────
+    shiny::onStop(function() {
+      if (!is.null(con_activa())) {
+        tryCatch(DBI::dbDisconnect(con_activa()), error = function(e) NULL)
+      }
+    })
+
+  })
+}

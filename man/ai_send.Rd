@@ -21,3 +21,4 @@ Lista con \code{text} (respuesta completa) y \code{code}
 Usa curl directamente para mayor compatibilidad con proxies corporativos.
 Enviar prompt al proveedor de IA configurado
 }
+\keyword{internal}

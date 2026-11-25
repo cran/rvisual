@@ -15,3 +15,4 @@ String con el prompt de sistema completo.
 \description{
 Construir el prompt de sistema para el asistente IA
 }
+\keyword{internal}

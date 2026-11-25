@@ -4,13 +4,17 @@
 \alias{op_recode}
 \title{Crear operacion: recodificar valores}
 \usage{
-op_recode(col, mapping)
+op_recode(col, mapping, numeric = NULL)
 }
 \arguments{
 \item{col}{Nombre de la columna a recodificar.}
 
 \item{mapping}{Lista nombrada con los reemplazos:
 \code{list(valor_original = valor_nuevo)}.}
+
+\item{numeric}{\code{TRUE} si la columna es numerica; \code{FALSE} si
+no (los valores originales van entre comillas en el codigo).
+\code{NULL} lo deduce de cada valor, como antes.}
 }
 \value{
 Lista de operacion con type="recode".

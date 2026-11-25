@@ -22,3 +22,4 @@ Lista de contexto usada por \code{build_system_prompt()}.
 \description{
 Construir el contexto para el asistente IA a partir del dataset activo
 }
+\keyword{internal}

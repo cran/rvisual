@@ -15,3 +15,4 @@ Lista con \code{success} (logical) y \code{message} (detalle).
 \description{
 Probar la conexion con el proveedor de IA configurado
 }
+\keyword{internal}
